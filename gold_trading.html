@@ -511,6 +511,7 @@ let audioCtx      = null;
 let audioReady    = false;   // AudioContext 已被用户交互激活
 let lastSignalKey = '';      // 上次信号 key
 let lastSTTrend   = null;    // 上次 ST 趋势方向
+let lastTechMarkerTime = 0;  // 上次技术信号标记时间（防重复播放）
 
 // 初始化并 resume AudioContext（需用户手势触发）
 async function initAudio() {
@@ -589,6 +590,7 @@ async function toggleSound() {
     [[440,0,.1],[523.25,.12,.12]].forEach(([f,s,d]) => playNote(f,s,d,'sine',.12));
     // 重置 key，并在测试音结束后根据当前显示信号立即播放一次
     lastSignalKey = '';
+    lastTechMarkerTime = 0;   // 重置，让最新标记重新触发
     setTimeout(() => {
       const nameEl = document.getElementById('sig-name');
       if (!nameEl) return;
@@ -797,6 +799,17 @@ function renderChart(data) {
   const allMarkers   = [...st.markers, ...techMarkers]
     .sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(allMarkers);
+
+  // ── 技术信号标记音效触发 ──
+  if (techMarkers.length > 0) {
+    const last = techMarkers[techMarkers.length - 1];
+    if (last.time > lastTechMarkerTime) {
+      lastTechMarkerTime = last.time;
+      const txt = last.text || '';
+      if (txt.includes('买') || txt.includes('强买')) playBuySound();
+      else if (txt.includes('卖') || txt.includes('强卖')) playSellSound();
+    }
+  }
 
   // 更新侧边栏多空状态
   updateSTStatus(st.lastTrend, data[data.length - 1].c,
