@@ -506,12 +506,13 @@ let refreshTimer = null;
 let sidebarVisible = true;
 
 // ── 音效系统 ──────────────────────────────────────────────
-let soundEnabled  = false;   // 默认关闭，等用户主动点击开启
+let soundEnabled  = false;
 let audioCtx      = null;
-let audioReady    = false;   // AudioContext 已被用户交互激活
-let lastSignalKey = '';      // 上次信号 key
-let lastSTTrend   = null;    // 上次 ST 趋势方向
-let lastTechMarkerTime = 0;  // 上次技术信号标记时间（防重复播放）
+let audioReady    = false;
+let lastSTTrend   = null;
+// 信号去重：记录上次播放时对应的标识
+let _lastSigKey   = '';      // 侧边栏信号
+let _lastMkrTime  = 0;       // 图表标记（仅在 soundEnabled 时更新）
 
 // 初始化并 resume AudioContext（需用户手势触发）
 async function initAudio() {
@@ -586,16 +587,18 @@ async function toggleSound() {
     btn.textContent = '🔔';
     btn.style.opacity = '1';
     btn.style.borderColor = 'rgba(232,184,75,.6)';
+    // 重置去重标记，让当前信号重新触发
+    _lastSigKey  = '';
+    _lastMkrTime = 0;
     showToast('🔔 提示音已开启', 'buy');
     [[440,0,.1],[523.25,.12,.12]].forEach(([f,s,d]) => playNote(f,s,d,'sine',.12));
-    // 重置 key，并在测试音结束后根据当前显示信号立即播放一次
-    lastSignalKey = '';
-    lastTechMarkerTime = 0;   // 重置，让最新标记重新触发
+    // 500ms 后（测试音结束）立即播放当前活跃信号
     setTimeout(() => {
+      if (!soundEnabled || !audioReady) return;
       const nameEl = document.getElementById('sig-name');
       if (!nameEl) return;
-      if (nameEl.classList.contains('long'))       { lastSignalKey='long:_init'; playBuySound(); }
-      else if (nameEl.classList.contains('short')) { lastSignalKey='short:_init'; playSellSound(); }
+      if (nameEl.classList.contains('long'))  playBuySound();
+      else if (nameEl.classList.contains('short')) playSellSound();
     }, 500);
   } else {
     btn.textContent = '🔕';
@@ -800,14 +803,14 @@ function renderChart(data) {
     .sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(allMarkers);
 
-  // ── 技术信号标记音效触发 ──
-  if (techMarkers.length > 0) {
+  // ── 技术信号标记音效触发（仅 soundEnabled 时才标记已处理，避免漏播）──
+  if (soundEnabled && audioReady && techMarkers.length > 0) {
     const last = techMarkers[techMarkers.length - 1];
-    if (last.time > lastTechMarkerTime) {
-      lastTechMarkerTime = last.time;
+    if (last.time > _lastMkrTime) {
+      _lastMkrTime = last.time;
       const txt = last.text || '';
-      if (txt.includes('买') || txt.includes('强买')) playBuySound();
-      else if (txt.includes('卖') || txt.includes('强卖')) playSellSound();
+      if (txt.includes('买')) playBuySound();
+      else if (txt.includes('卖')) playSellSound();
     }
   }
 
@@ -1086,12 +1089,12 @@ function setSignal(type, name, strength, rows) {
 
   // 播放音效：信号方向变化时才触发（neutral 不触发）
   const sigKey = type + ':' + strength;
-  if (sigKey !== lastSignalKey && type !== 'neutral') {
-    lastSignalKey = sigKey;
+  if (sigKey !== _lastSigKey && type !== 'neutral') {
+    _lastSigKey = sigKey;
     if (type === 'long')  playBuySound();
     if (type === 'short') playSellSound();
-  } else if (type === 'neutral' && lastSignalKey !== 'neutral') {
-    lastSignalKey = 'neutral';
+  } else if (type === 'neutral' && _lastSigKey !== 'neutral') {
+    _lastSigKey = 'neutral';
   }
 }
 
