@@ -543,14 +543,14 @@ function playNote(freq, startOffset, dur, type = 'sine', vol = 0.18) {
 function playBuySound() {
   if (!soundEnabled || !audioReady) return;
   showToast('🟢 做多信号', 'buy');
-  [[523.25,0,.12],[659.25,.14,.18],[783.99,.30,.28]].forEach(([f,s,d]) => playNote(f,s,d,'sine',.18));
+  [[523.25,0,.15],[659.25,.17,.22],[783.99,.42,.35]].forEach(([f,s,d]) => playNote(f,s,d,'sine',.35));
 }
 
 // 做空：三声下行（La-Fa-Do）
 function playSellSound() {
   if (!soundEnabled || !audioReady) return;
   showToast('🔴 做空信号', 'sell');
-  [[880,0,.15],[698.46,.17,.18],[523.25,.37,.28]].forEach(([f,s,d]) => playNote(f,s,d,'triangle',.16));
+  [[880,0,.18],[698.46,.20,.22],[523.25,.45,.35]].forEach(([f,s,d]) => playNote(f,s,d,'triangle',.35));
 }
 
 // ST 翻转：两声短促
@@ -585,9 +585,16 @@ async function toggleSound() {
     btn.textContent = '🔔';
     btn.style.opacity = '1';
     btn.style.borderColor = 'rgba(232,184,75,.6)';
-    // 播测试音确认已激活
     showToast('🔔 提示音已开启', 'buy');
     [[440,0,.1],[523.25,.12,.12]].forEach(([f,s,d]) => playNote(f,s,d,'sine',.12));
+    // 重置 key，并在测试音结束后根据当前显示信号立即播放一次
+    lastSignalKey = '';
+    setTimeout(() => {
+      const nameEl = document.getElementById('sig-name');
+      if (!nameEl) return;
+      if (nameEl.classList.contains('long'))       { lastSignalKey='long:_init'; playBuySound(); }
+      else if (nameEl.classList.contains('short')) { lastSignalKey='short:_init'; playSellSound(); }
+    }, 500);
   } else {
     btn.textContent = '🔕';
     btn.style.opacity = '0.45';
