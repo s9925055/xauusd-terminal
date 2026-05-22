@@ -1245,7 +1245,7 @@ function toggleSidebar() {
 //  INIT
 // ═══════════════════════════════════════════════════
 async function fetchHistory(tf) {
-  const interval = (tf === '1m') ? '1m' : '5m';
+  const interval = { '1m':'1m', '5m':'5m', '15m':'15m', '1h':'1H' }[tf] || '5m';
   try {
     const res = await fetch(`http://localhost:8888/api/history?interval=${interval}`, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) throw new Error('HTTP ' + res.status);

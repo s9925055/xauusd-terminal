@@ -36,7 +36,7 @@ state = {
 }
 state_lock = threading.Lock()
 
-history = {"1m": [], "5m": []}
+history = {"1m": [], "5m": [], "15m": [], "1H": []}
 hist_lock = threading.Lock()
 
 sse_clients = []
@@ -241,12 +241,16 @@ def start_ws():
 def hist_loop():
     while True:
         time.sleep(30)
-        k1 = fetch_klines("1m", 300)
-        k5 = fetch_klines("5m", 300)
+        k1   = fetch_klines("1m",  300)
+        k5   = fetch_klines("5m",  300)
+        k15  = fetch_klines("15m", 300)
+        k1h  = fetch_klines("1H",  300)
         with hist_lock:
-            if k1: history["1m"] = k1
-            if k5: history["5m"] = k5
-        print(f"[{now_str()}] K线刷新  1m:{len(k1)}  5m:{len(k5)}")
+            if k1:  history["1m"]  = k1
+            if k5:  history["5m"]  = k5
+            if k15: history["15m"] = k15
+            if k1h: history["1H"]  = k1h
+        print(f"[{now_str()}] K线刷新  1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
 
 
 # ── HTTP Handler ──────────────────────────────────────────
@@ -309,7 +313,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(body)
 
         elif path == "/api/history":
-            iv = "1m" if "interval=1m" in self.path else "5m"
+            iv_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1H": "1H"}
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            iv = iv_map.get(qs.get("interval", ["5m"])[0], "5m")
             with hist_lock:
                 candles = list(history[iv])
             self._json(json.dumps({"candles": candles}).encode())
@@ -370,12 +377,16 @@ if __name__ == "__main__":
             state["change_pct"] = round((p - pc) / pc * 100, 3)
     print(f"  初始价格: ${state['price']:.2f}")
 
-    k1 = fetch_klines("1m", 300)
-    k5 = fetch_klines("5m", 300)
+    k1  = fetch_klines("1m",  300)
+    k5  = fetch_klines("5m",  300)
+    k15 = fetch_klines("15m", 300)
+    k1h = fetch_klines("1H",  300)
     with hist_lock:
-        if k1: history["1m"] = k1
-        if k5: history["5m"] = k5
-    print(f"  K线就绪: 1m:{len(k1)}  5m:{len(k5)}")
+        if k1:  history["1m"]  = k1
+        if k5:  history["5m"]  = k5
+        if k15: history["15m"] = k15
+        if k1h: history["1H"]  = k1h
+    print(f"  K线就绪: 1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
 
     start_ws()
     threading.Thread(target=hist_loop, daemon=True).start()
