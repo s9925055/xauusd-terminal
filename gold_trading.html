@@ -632,8 +632,8 @@ function initChart() {
   ema20S  = chart.addLineSeries({ color: 'rgba(232,184,75,0.8)',  lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
   ema50S  = chart.addLineSeries({ color: 'rgba(91,141,238,0.7)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
   ema200S = chart.addLineSeries({ color: 'rgba(224,82,82,0.5)',  lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-  bbUpperS = chart.addLineSeries({ color: 'rgba(91,141,238,0.25)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
-  bbLowerS = chart.addLineSeries({ color: 'rgba(91,141,238,0.25)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
+  bbUpperS = chart.addLineSeries({ color: 'rgba(100,160,255,0.7)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
+  bbLowerS = chart.addLineSeries({ color: 'rgba(100,160,255,0.7)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
 
   // Supertrend: 低调虚线，不抢主图风头
   stBullS = chart.addLineSeries({ color: 'rgba(61,214,140,0.55)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
@@ -889,11 +889,15 @@ function generateMarkers(data) {
     const sellScore = (bearEngulf ? 2 : 0) + (shootStar ? 2 : 0) + (deathCross ? 3 : 0) +
                       (bbReject ? 2 : 0) + (emaBreak ? 1 : 0);
 
+    // 趋势过滤：大方向必须一致才允许信号出现
+    const uptrend   = e20c > e50c;   // EMA20 在 EMA50 之上 → 短期上升趋势
+    const downtrend = e20c < e50c;   // EMA20 在 EMA50 之下 → 短期下降趋势
+
     // 去重：与前一个信号间隔至少3根K线
     const lastM = markers[markers.length - 1];
     const tooClose = lastM && (d.t - lastM.time) < 3 * (data[1].t - data[0].t || 300);
 
-    if (!tooClose && buyScore >= 3 && buyScore > sellScore) {
+    if (!tooClose && buyScore >= 3 && buyScore > sellScore && uptrend) {
       markers.push({
         time: d.t,
         position: 'belowBar',
@@ -902,7 +906,7 @@ function generateMarkers(data) {
         text: buyScore >= 5 ? '强买▲' : '买▲',
         size: buyScore >= 5 ? 2 : 1,
       });
-    } else if (!tooClose && sellScore >= 3 && sellScore > buyScore) {
+    } else if (!tooClose && sellScore >= 3 && sellScore > buyScore && downtrend) {
       markers.push({
         time: d.t,
         position: 'aboveBar',
@@ -1040,7 +1044,7 @@ function analyzeSignal(data, priceInfo) {
     { label: 'EMA200', val: e200.toFixed(2), cls: price > e200 ? 'val-green' : 'val-red' },
     { label: 'BB上轨', val: bbUp ? bbUp.toFixed(2) : '—', cls: 'val-blue' },
     { label: 'BB下轨', val: bbLo ? bbLo.toFixed(2) : '—', cls: 'val-blue' },
-    { label: 'BB宽度', val: bbWidth.toFixed(2) + '%', cls: 'val-gold' },
+    { label: 'BB宽度', val: bbWidth.toFixed(2) + '%' + (bbWidth < 0.15 ? ' 🔴压缩' : bbWidth > 0.5 ? ' ⚠扩张' : ''), cls: bbWidth < 0.15 ? 'val-red' : bbWidth > 0.5 ? 'val-gold' : 'val-green' },
   ];
 
   if (longScore >= 60 && longScore > shortScore + 10) {
