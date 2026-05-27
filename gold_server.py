@@ -153,8 +153,8 @@ def detect_signals(candles):
             last_sig_t = d['t']
             result = {'t': d['t'], 'dir': '强卖▼' if sell_score >= 5 else '卖▼', 'score': sell_score, 'price': d['c']}
 
-    # 只返回最新一根 K 线上的信号
-    if result and result['t'] == candles[-1]['t']:
+    # 返回最近3根K线内的信号（防止30s刷新周期漏检）
+    if result and result['t'] >= candles[-3]['t']:
         return result
     return None
 
@@ -398,21 +398,27 @@ def _check_and_notify(candles, tf):
 
 
 def hist_loop():
+    tick = 0
     while True:
-        time.sleep(30)
-        k1   = fetch_klines("1m",  300)
-        k5   = fetch_klines("5m",  300)
-        k15  = fetch_klines("15m", 300)
-        k1h  = fetch_klines("1H",  300)
+        time.sleep(15)
+        tick += 1
+        # 1m 每15秒刷新一次（确保不漏1分钟K线的信号）
+        k1 = fetch_klines("1m", 300)
         with hist_lock:
-            if k1:  history["1m"]  = k1
-            if k5:  history["5m"]  = k5
-            if k15: history["15m"] = k15
-            if k1h: history["1H"]  = k1h
-        print(f"[{now_str()}] K线刷新  1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
-        # 检测 1m 和 5m 信号并推送飞书
+            if k1: history["1m"] = k1
         if k1: _check_and_notify(k1, "1m")
-        if k5: _check_and_notify(k5, "5m")
+
+        # 5m/15m/1H 每30秒刷新一次
+        if tick % 2 == 0:
+            k5  = fetch_klines("5m",  300)
+            k15 = fetch_klines("15m", 300)
+            k1h = fetch_klines("1H",  300)
+            with hist_lock:
+                if k5:  history["5m"]  = k5
+                if k15: history["15m"] = k15
+                if k1h: history["1H"]  = k1h
+            print(f"[{now_str()}] K线刷新  1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
+            if k5: _check_and_notify(k5, "5m")
 
 
 # ── HTTP Handler ──────────────────────────────────────────
