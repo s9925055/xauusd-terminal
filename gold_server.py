@@ -91,6 +91,78 @@ def send_feishu(signal: str, price: float, score: int, tf: str):
         print(f"[{now_str()}] 飞书推送失败: {e}")
 
 
+# ── 信号检测（Python 版，与前端逻辑一致）────────────────────
+def _calc_ema(candles, period):
+    k = 2 / (period + 1)
+    ema = None
+    out = []
+    for c in candles:
+        ema = c['c'] if ema is None else c['c'] * k + ema * (1 - k)
+        out.append(ema)
+    return out
+
+def _calc_bb(candles, period=20, mult=2):
+    upper, lower = [], []
+    for i in range(len(candles)):
+        if i < period - 1:
+            upper.append(None); lower.append(None); continue
+        sl   = [c['c'] for c in candles[i - period + 1:i + 1]]
+        mean = sum(sl) / period
+        std  = (sum((x - mean) ** 2 for x in sl) / period) ** 0.5
+        upper.append(mean + mult * std)
+        lower.append(mean - mult * std)
+    return upper, lower
+
+def detect_signals(candles):
+    """返回最新一根 K 线上的信号，无信号返回 None"""
+    if len(candles) < 56:
+        return None
+    e20 = _calc_ema(candles, 20)
+    e50 = _calc_ema(candles, 50)
+    bb_upper, bb_lower = _calc_bb(candles, 20, 2)
+    interval = candles[1]['t'] - candles[0]['t']
+
+    last_sig_t = 0
+    result = None
+    for i in range(55, len(candles)):
+        d, prev = candles[i], candles[i - 1]
+        e20c, e20p = e20[i], e20[i - 1]
+        e50c, e50p = e50[i], e50[i - 1]
+        bbu, bbl   = bb_upper[i], bb_lower[i]
+
+        bull_engulf  = d['c'] > d['o'] and d['o'] <= prev['c'] and d['c'] >= prev['o'] and (d['c'] - d['o']) > (prev['o'] - prev['c']) * 0.8
+        hammer       = d['c'] > d['o'] and (d['o'] - d['l']) > (d['c'] - d['o']) * 1.8 and (d['h'] - d['c']) < (d['c'] - d['o'])
+        ema_cross    = e20p < e50p and e20c > e50c
+        bb_bounce    = bbl and d['l'] <= bbl and d['c'] > bbl and d['c'] > d['o']
+        ema_support  = d['c'] > d['o'] and prev['c'] < e20p and d['c'] > e20c
+        buy_score    = (2 if bull_engulf else 0) + (2 if hammer else 0) + (3 if ema_cross else 0) + (2 if bb_bounce else 0) + (1 if ema_support else 0)
+
+        bear_engulf  = d['c'] < d['o'] and d['o'] >= prev['c'] and d['c'] <= prev['o'] and (d['o'] - d['c']) > (prev['c'] - prev['o']) * 0.8
+        shoot_star   = d['c'] < d['o'] and (d['h'] - d['o']) > (d['o'] - d['c']) * 1.8 and (d['c'] - d['l']) < (d['o'] - d['c'])
+        death_cross  = e20p > e50p and e20c < e50c
+        bb_reject    = bbu and d['h'] >= bbu and d['c'] < bbu and d['c'] < d['o']
+        ema_break    = d['c'] < d['o'] and prev['c'] > e20p and d['c'] < e20c
+        sell_score   = (2 if bear_engulf else 0) + (2 if shoot_star else 0) + (3 if death_cross else 0) + (2 if bb_reject else 0) + (1 if ema_break else 0)
+
+        too_close = (d['t'] - last_sig_t) < 3 * interval
+
+        if not too_close and buy_score >= 3 and buy_score > sell_score:
+            last_sig_t = d['t']
+            result = {'t': d['t'], 'dir': '强买▲' if buy_score >= 5 else '买▲', 'score': buy_score, 'price': d['c']}
+        elif not too_close and sell_score >= 3 and sell_score > buy_score:
+            last_sig_t = d['t']
+            result = {'t': d['t'], 'dir': '强卖▼' if sell_score >= 5 else '卖▼', 'score': sell_score, 'price': d['c']}
+
+    # 只返回最新一根 K 线上的信号
+    if result and result['t'] == candles[-1]['t']:
+        return result
+    return None
+
+
+# ── 已推送信号记录（防重复推送）────────────────────────────
+_sent_signals = {}   # key: "{tf}_{candle_t}" → True
+
+
 # ── OKX REST：K 线 ────────────────────────────────────────
 def fetch_klines(bar, limit=300):
     """bar: 1m / 5m"""
@@ -309,6 +381,22 @@ def stats_loop():
 
 
 # ── K 线定时刷新 ──────────────────────────────────────────
+def _check_and_notify(candles, tf):
+    """检测信号并推送飞书（防重复）"""
+    sig = detect_signals(candles)
+    if not sig:
+        return
+    key = f"{tf}_{sig['t']}"
+    if key in _sent_signals:
+        return
+    _sent_signals[key] = True
+    # 只保留最近 200 条记录，防止内存无限增长
+    if len(_sent_signals) > 200:
+        oldest = list(_sent_signals.keys())[0]
+        del _sent_signals[oldest]
+    send_feishu(sig['dir'], sig['price'], sig['score'], tf)
+
+
 def hist_loop():
     while True:
         time.sleep(30)
@@ -322,6 +410,9 @@ def hist_loop():
             if k15: history["15m"] = k15
             if k1h: history["1H"]  = k1h
         print(f"[{now_str()}] K线刷新  1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
+        # 检测 1m 和 5m 信号并推送飞书
+        if k1: _check_and_notify(k1, "1m")
+        if k5: _check_and_notify(k5, "5m")
 
 
 # ── HTTP Handler ──────────────────────────────────────────
