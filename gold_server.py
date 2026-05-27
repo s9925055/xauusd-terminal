@@ -237,6 +237,34 @@ def start_ws():
     t.start()
 
 
+# ── 24h 统计定时刷新（每5分钟同步一次 OKX 的日内高低/开盘/前收）──
+def stats_loop():
+    while True:
+        time.sleep(300)   # 5 分钟
+        stats = fetch_24h()
+        if not stats:
+            continue
+        with state_lock:
+            # open / prev_close 固定用 OKX 提供的值（不随价格漂移）
+            state["open"]       = stats.get("open")
+            state["prev_close"] = stats.get("prev_close")
+            # high / low 取 OKX 24h 值与本地追踪值的更优解
+            okx_high = stats.get("high")
+            okx_low  = stats.get("low")
+            if okx_high and (state["high"] is None or okx_high > state["high"]):
+                state["high"] = okx_high
+            if okx_low and (state["low"] is None or okx_low < state["low"]):
+                state["low"] = okx_low
+            # 同步更新 change / change_pct
+            price = state["price"] or stats.get("last")
+            prev  = state["prev_close"]
+            if price and prev:
+                state["change"]     = round(price - prev, 2)
+                state["change_pct"] = round((price - prev) / prev * 100, 3)
+        print(f"[{now_str()}] 24h统计刷新  open:{state['open']}  "
+              f"high:{state['high']}  low:{state['low']}  prev:{state['prev_close']}")
+
+
 # ── K 线定时刷新 ──────────────────────────────────────────
 def hist_loop():
     while True:
@@ -389,7 +417,8 @@ if __name__ == "__main__":
     print(f"  K线就绪: 1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
 
     start_ws()
-    threading.Thread(target=hist_loop, daemon=True).start()
+    threading.Thread(target=hist_loop,  daemon=True).start()
+    threading.Thread(target=stats_loop, daemon=True).start()
 
     server = ThreadedServer(("localhost", PORT), Handler)
     try:
