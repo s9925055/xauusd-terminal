@@ -805,7 +805,9 @@ function renderChart(data) {
   stBearS.setData(st.bearLine.filter(d => d.value !== null));
 
   // 合并 Supertrend 趋势翻转标记 + 技术信号标记
-  const techMarkers  = generateMarkers(data);
+  // 只对已收盘K线生成信号（排除最后一根未收盘K线），避免信号闪烁
+  const closedData   = data.slice(0, -1);
+  const techMarkers  = generateMarkers(closedData);
   const allMarkers   = [...st.markers, ...techMarkers]
     .sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(allMarkers);

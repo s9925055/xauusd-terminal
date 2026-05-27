@@ -14,9 +14,21 @@ import time
 import socketserver
 import requests
 import websocket
+import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+# 日志同时写到文件和终端
+LOG_FILE = Path(__file__).parent / "gold_server.log"
+_log_lock = threading.Lock()
+
+def log(msg):
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    with _log_lock:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
 
 PORT      = 8888
 HTML_FILE = Path(__file__).parent / "gold_trading.html"
@@ -60,16 +72,14 @@ def send_feishu(signal: str, price: float, score: int, tf: str):
     }
     emoji = emoji_map.get(signal, "📊")
     ts    = datetime.now().strftime("%H:%M:%S")
-    title = f"{emoji} XAU/USD {signal}"
+    title = f"{emoji} [{tf}] XAU/USD {signal}"
     content = (
         f"**时间**：{ts}\n"
         f"**价格**：${price:.2f}\n"
-        f"**周期**：{tf}\n"
         f"**得分**：{score}分"
     ) if score else (
         f"**时间**：{ts}\n"
-        f"**价格**：${price:.2f}\n"
-        f"**周期**：{tf}"
+        f"**价格**：${price:.2f}"
     )
     body = {
         "msg_type": "interactive",
@@ -86,12 +96,13 @@ def send_feishu(signal: str, price: float, score: int, tf: str):
     }
     try:
         requests.post(FEISHU_WEBHOOK, json=body, timeout=5)
-        print(f"[{now_str()}] 飞书推送: {title} ${price:.2f}")
+        log(f" 飞书推送: {title} ${price:.2f}")
     except Exception as e:
-        print(f"[{now_str()}] 飞书推送失败: {e}")
+        log(f" 飞书推送失败: {e}")
 
 
 # ── 信号检测（Python 版，与前端逻辑一致）────────────────────
+_TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1H": 3600}
 def _calc_ema(candles, period):
     k = 2 / (period + 1)
     ema = None
@@ -113,7 +124,7 @@ def _calc_bb(candles, period=20, mult=2):
         lower.append(mean - mult * std)
     return upper, lower
 
-def detect_signals(candles):
+def detect_signals(candles, tf="1m"):
     """返回最新一根 K 线上的信号，无信号返回 None"""
     if len(candles) < 56:
         return None
@@ -153,9 +164,72 @@ def detect_signals(candles):
             last_sig_t = d['t']
             result = {'t': d['t'], 'dir': '强卖▼' if sell_score >= 5 else '卖▼', 'score': sell_score, 'price': d['c']}
 
-    # 返回最近3根K线内的信号（防止30s刷新周期漏检）
-    if result and result['t'] >= candles[-3]['t']:
+    # 窗口 = K线周期 + 3分钟缓冲（信号时间戳是开盘时间，收盘后才能检测）
+    tf_sec  = _TF_SECONDS.get(tf, 60)
+    max_age = tf_sec + 180
+    now = time.time()
+    if result and (now - result['t']) <= max_age:
         return result
+    if result:
+        sig_time = datetime.fromtimestamp(result['t']).strftime('%H:%M')
+        age_min  = int((now - result['t']) / 60)
+        log(f" detect: 有信号 {result['dir']} @ {sig_time}，已过 {age_min} 分钟，跳过")
+    return None
+
+
+# ── SuperTrend 检测（ATR period=10, mult=2.5）────────────────
+def detect_st_flip(candles, period=10, mult=2.5):
+    """返回最新一根已收盘K线是否发生 ST 翻转，无翻转返回 None"""
+    if len(candles) < period + 1:
+        return None
+    # ATR
+    tr = []
+    for i, d in enumerate(candles):
+        if i == 0:
+            tr.append(d['h'] - d['l'])
+        else:
+            prev = candles[i - 1]
+            tr.append(max(d['h'] - d['l'], abs(d['h'] - prev['c']), abs(d['l'] - prev['c'])))
+    atr = []
+    atr_val = sum(tr[:period]) / period
+    for i in range(len(candles)):
+        if i < period:
+            atr.append(atr_val)
+            continue
+        atr_val = (atr_val * (period - 1) + tr[i]) / period
+        atr.append(atr_val)
+
+    up_band = dn_band = 0
+    trend = 1
+    prev_up = prev_dn = 0
+    prev_trend = 1
+    flip = None
+
+    for i, d in enumerate(candles):
+        hl2    = (d['h'] + d['l']) / 2
+        raw_up = hl2 + mult * atr[i]
+        raw_dn = hl2 - mult * atr[i]
+        if i == 0:
+            up_band = raw_up
+            dn_band = raw_dn
+        else:
+            up_band = raw_up if (raw_up < prev_up or candles[i-1]['c'] > prev_up) else prev_up
+            dn_band = raw_dn if (raw_dn > prev_dn or candles[i-1]['c'] < prev_dn) else prev_dn
+
+        prev_trend = trend
+        if trend == -1 and d['c'] > up_band:
+            trend = 1
+        elif trend == 1 and d['c'] < dn_band:
+            trend = -1
+
+        if trend != prev_trend:
+            flip = {'t': d['t'], 'dir': 'ST转多' if trend == 1 else 'ST转空', 'price': d['c']}
+
+        prev_up = up_band
+        prev_dn = dn_band
+
+    if flip and flip['t'] == candles[-1]['t']:
+        return flip
     return None
 
 
@@ -176,16 +250,17 @@ def fetch_klines(bar, limit=300):
         result = []
         for row in reversed(data):
             result.append({
-                "t": int(row[0]) // 1000,
-                "o": float(row[1]),
-                "h": float(row[2]),
-                "l": float(row[3]),
-                "c": float(row[4]),
-                "v": float(row[5]),
+                "t":       int(row[0]) // 1000,
+                "o":       float(row[1]),
+                "h":       float(row[2]),
+                "l":       float(row[3]),
+                "c":       float(row[4]),
+                "v":       float(row[5]),
+                "confirm": int(row[8]),   # 1=已收盘, 0=当前未收盘
             })
         return result
     except Exception as e:
-        print(f"[{now_str()}] K线拉取失败 {bar}: {e}")
+        log(f" K线拉取失败 {bar}: {e}")
         return []
 
 
@@ -204,7 +279,7 @@ def fetch_24h():
             "ask":       float(d["askPx"]),
         }
     except Exception as e:
-        print(f"[{now_str()}] 24h统计失败: {e}")
+        log(f" 24h统计失败: {e}")
         return {}
 
 
@@ -244,7 +319,7 @@ def _make_payload(price, snap):
 ws_app = None
 
 def on_open(ws):
-    print(f"[{now_str()}] ✅ 已连接 OKX WebSocket")
+    log(f" ✅ 已连接 OKX WebSocket")
     # 订阅 tickers（每次价格变化推送）
     ws.send(json.dumps({
         "op": "subscribe",
@@ -261,7 +336,7 @@ def on_message(ws, message):
 
         # 忽略订阅确认
         if msg.get("event") in ("subscribe", "error"):
-            print(f"[{now_str()}] WS事件: {msg}")
+            log(f" WS事件: {msg}")
             return
 
         arg  = msg.get("arg", {})
@@ -317,20 +392,20 @@ def on_message(ws, message):
         _broadcast(_make_payload(price, snap))
 
         if snap["tick_count"] % 200 == 1:
-            print(f"[{now_str()}] [{ch}] XAU={price:.2f}  "
+            log(f" [{ch}] XAU={price:.2f}  "
                   f"bid={snap['bid']:.2f} ask={snap['ask']:.2f}  "
                   f"tick#{snap['tick_count']}")
 
     except Exception as e:
-        print(f"[{now_str()}] on_message 错误: {e}")
+        log(f" on_message 错误: {e}")
 
 
 def on_error(ws, error):
-    print(f"[{now_str()}] WebSocket 错误: {error}")
+    log(f" WebSocket 错误: {error}")
 
 
 def on_close(ws, code, msg):
-    print(f"[{now_str()}] WebSocket 断开，5秒后重连...")
+    log(f" WebSocket 断开，5秒后重连...")
     time.sleep(5)
     start_ws()
 
@@ -376,29 +451,45 @@ def stats_loop():
             if price and prev:
                 state["change"]     = round(price - prev, 2)
                 state["change_pct"] = round((price - prev) / prev * 100, 3)
-        print(f"[{now_str()}] 24h统计刷新  open:{state['open']}  "
+        log(f" 24h统计刷新  open:{state['open']}  "
               f"high:{state['high']}  low:{state['low']}  prev:{state['prev_close']}")
 
 
 # ── K 线定时刷新 ──────────────────────────────────────────
-def _check_and_notify(candles, tf):
-    """检测信号并推送飞书（防重复）"""
-    sig = detect_signals(candles)
-    if not sig:
-        return
+def _push_if_new(sig, tf):
+    """推送信号，防重复"""
     key = f"{tf}_{sig['t']}"
+    sig_time = datetime.fromtimestamp(sig['t']).strftime('%H:%M')
     if key in _sent_signals:
+        log(f" [{tf}] 信号已推过: {sig['dir']} @ {sig_time}，跳过")
         return
     _sent_signals[key] = True
-    # 只保留最近 200 条记录，防止内存无限增长
     if len(_sent_signals) > 200:
         oldest = list(_sent_signals.keys())[0]
         del _sent_signals[oldest]
-    send_feishu(sig['dir'], sig['price'], sig['score'], tf)
+    score = sig.get('score', 0)
+    log(f" [{tf}] 新信号: {sig['dir']} @ {sig_time}" + (f"  score={score}" if score else ""))
+    send_feishu(sig['dir'], sig['price'], score, tf)
+
+def _check_and_notify(candles, tf):
+    """检测技术信号 + ST翻转，推送飞书（防重复）"""
+    # 只对已收盘的 K 线检测信号，排除当前未收盘的最后一根
+    closed = [c for c in candles if c.get("confirm", 1) == 1]
+    if not closed:
+        return
+    # 技术信号（买▲ / 卖▼ / 强买▲ / 强卖▼）
+    sig = detect_signals(closed, tf)
+    if sig:
+        _push_if_new(sig, tf)
+    # ST 翻转（多▲ / 空▼）
+    st = detect_st_flip(closed)
+    if st:
+        _push_if_new(st, tf)
 
 
 def hist_loop():
     tick = 0
+    log(" hist_loop 启动")
     while True:
         time.sleep(15)
         tick += 1
@@ -406,7 +497,9 @@ def hist_loop():
         k1 = fetch_klines("1m", 300)
         with hist_lock:
             if k1: history["1m"] = k1
-        if k1: _check_and_notify(k1, "1m")
+        if k1:
+            log(f" [1m] tick#{tick} 拉取 {len(k1)} 根K线，最新:{datetime.fromtimestamp(k1[-1]['t']).strftime('%H:%M')}")
+            _check_and_notify(k1, "1m")
 
         # 5m/15m/1H 每30秒刷新一次
         if tick % 2 == 0:
@@ -417,7 +510,7 @@ def hist_loop():
                 if k5:  history["5m"]  = k5
                 if k15: history["15m"] = k15
                 if k1h: history["1H"]  = k1h
-            print(f"[{now_str()}] K线刷新  1m:{len(k1)}  5m:{len(k5)}  15m:{len(k15)}  1H:{len(k1h)}")
+            log(f" K线刷新  1m:{len(k1)}  5m:{len(k5) if k5 else 0}  15m:{len(k15) if k15 else 0}  1H:{len(k1h) if k1h else 0}")
             if k5: _check_and_notify(k5, "5m")
 
 
@@ -444,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
             price  = float(body.get("price", 0))
             score  = int(body.get("score", 0))
             tf     = body.get("tf", "")
+            log(f" /api/notify 收到浏览器信号: {signal} ${price:.2f} [{tf}]")
             threading.Thread(
                 target=send_feishu, args=(signal, price, score, tf), daemon=True
             ).start()
