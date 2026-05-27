@@ -26,6 +26,8 @@ OKX_REST  = "https://www.okx.com/api/v5"
 INST_ID   = "XAU-USDT-SWAP"   # 黄金永续合约
 KLINE_ID  = "XAU-USDT-SWAP"
 
+FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/0d9a72f4-e58a-4da9-bfe1-e94db4ff07ea"
+
 # ── 全局状态 ──────────────────────────────────────────────
 state = {
     "price": None, "prev_close": None, "open": None,
@@ -46,6 +48,47 @@ sse_lock = threading.Lock()
 # ── 工具 ─────────────────────────────────────────────────
 def now_str():
     return datetime.now().strftime("%H:%M:%S")
+
+
+# ── 飞书推送 ──────────────────────────────────────────────
+def send_feishu(signal: str, price: float, score: int, tf: str):
+    """signal: 买▲ / 强买▲ / 卖▼ / 强卖▼ / ST转多 / ST转空"""
+    emoji_map = {
+        "买▲":  "🟢", "强买▲": "🔥",
+        "卖▼":  "🔴", "强卖▼": "⚡",
+        "ST转多": "⬆️", "ST转空": "⬇️",
+    }
+    emoji = emoji_map.get(signal, "📊")
+    ts    = datetime.now().strftime("%H:%M:%S")
+    title = f"{emoji} XAU/USD {signal}"
+    content = (
+        f"**时间**：{ts}\n"
+        f"**价格**：${price:.2f}\n"
+        f"**周期**：{tf}\n"
+        f"**得分**：{score}分"
+    ) if score else (
+        f"**时间**：{ts}\n"
+        f"**价格**：${price:.2f}\n"
+        f"**周期**：{tf}"
+    )
+    body = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "green" if "买" in signal or "多" in signal else "red",
+            },
+            "elements": [{
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": content},
+            }],
+        },
+    }
+    try:
+        requests.post(FEISHU_WEBHOOK, json=body, timeout=5)
+        print(f"[{now_str()}] 飞书推送: {title} ${price:.2f}")
+    except Exception as e:
+        print(f"[{now_str()}] 飞书推送失败: {e}")
 
 
 # ── OKX REST：K 线 ────────────────────────────────────────
@@ -288,11 +331,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Cache-Control", "no-cache")
 
     def do_OPTIONS(self):
         self.send_response(200); self.cors(); self.end_headers()
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path == "/api/notify":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = json.loads(self.rfile.read(length) or b"{}")
+            signal = body.get("signal", "")
+            price  = float(body.get("price", 0))
+            score  = int(body.get("score", 0))
+            tf     = body.get("tf", "")
+            threading.Thread(
+                target=send_feishu, args=(signal, price, score, tf), daemon=True
+            ).start()
+            self.send_response(200)
+            self.cors(); self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+        else:
+            self.send_response(404); self.end_headers()
 
     def do_GET(self):
         path = self.path.split("?")[0]

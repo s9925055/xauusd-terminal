@@ -714,6 +714,13 @@ function calcSupertrend(data, period = 10, mult = 2.5) {
       if (i === data.length - 1 && trend !== lastSTTrend) {
         lastSTTrend = trend;
         playFlipSound(trend === 1);
+        const stSig = trend === 1 ? 'ST转多' : 'ST转空';
+        const stPx  = data[data.length - 1].c;
+        fetch('http://localhost:8888/api/notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ signal: stSig, price: stPx, score: 0, tf: currentTF }),
+        }).catch(() => {});
       }
       markers.push({
         time: t,
@@ -803,14 +810,25 @@ function renderChart(data) {
     .sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(allMarkers);
 
-  // ── 技术信号标记音效触发（仅 soundEnabled 时才标记已处理，避免漏播）──
-  if (soundEnabled && audioReady && techMarkers.length > 0) {
+  // ── 技术信号标记：音效 + 飞书推送 ──
+  if (techMarkers.length > 0) {
     const last = techMarkers[techMarkers.length - 1];
     if (last.time > _lastMkrTime) {
+      const isNew = soundEnabled && audioReady;
       _lastMkrTime = last.time;
-      const txt = last.text || '';
-      if (txt.includes('买')) playBuySound();
-      else if (txt.includes('卖')) playSellSound();
+      const txt   = last.text || '';
+      const price = data[data.length - 1].c;
+      const score = last.size >= 2 ? 5 : 4;
+      if (isNew) {
+        if (txt.includes('买')) playBuySound();
+        else if (txt.includes('卖')) playSellSound();
+      }
+      // 飞书推送（无论音效是否开启都发）
+      fetch('http://localhost:8888/api/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ signal: txt, price, score, tf: currentTF }),
+      }).catch(() => {});
     }
   }
 
