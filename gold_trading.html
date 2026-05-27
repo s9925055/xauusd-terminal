@@ -636,8 +636,8 @@ function initChart() {
   bbLowerS = chart.addLineSeries({ color: 'rgba(91,141,238,0.25)', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false });
 
   // Supertrend: 实线加粗，明显可见
-  stBullS = chart.addLineSeries({ color: 'rgba(61,214,140,0.85)', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
-  stBearS = chart.addLineSeries({ color: 'rgba(224,82,82,0.85)',  lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+  stBullS = chart.addLineSeries({ color: '#3dd68c', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
+  stBearS = chart.addLineSeries({ color: '#e05252', lineWidth: 2, priceLineVisible: false, lastValueVisible: false });
 
   volSeries = chart.addHistogramSeries({
     color: 'rgba(100,181,246,0.3)',
