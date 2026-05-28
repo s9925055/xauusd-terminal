@@ -63,24 +63,36 @@ def now_str():
 
 
 # ── 飞书推送 ──────────────────────────────────────────────
-def send_feishu(signal: str, price: float, score: int, tf: str):
+def send_feishu(signal: str, price: float, score: int, tf: str,
+                tp=None, sl=None, st_dir=None, strategy=None, atr=None):
     """signal: 买▲ / 强买▲ / 卖▼ / 强卖▼ / ST转多 / ST转空"""
     emoji_map = {
         "买▲":  "🟢", "强买▲": "🔥",
         "卖▼":  "🔴", "强卖▼": "⚡",
         "ST转多": "⬆️", "ST转空": "⬇️",
     }
-    emoji = emoji_map.get(signal, "📊")
-    ts    = datetime.now().strftime("%H:%M:%S")
-    title = f"{emoji} [{tf}] XAU/USD {signal}"
-    content = (
-        f"**时间**：{ts}\n"
-        f"**价格**：${price:.2f}\n"
-        f"**得分**：{score}分"
-    ) if score else (
-        f"**时间**：{ts}\n"
-        f"**价格**：${price:.2f}"
-    )
+    emoji    = emoji_map.get(signal, "📊")
+    ts       = datetime.now().strftime("%H:%M:%S")
+    suffix   = " 【策略L】" if strategy == "L" else ""
+    st_part  = f" {st_dir}" if st_dir else ""
+    title    = f"{emoji} [{tf}] XAU/USD {signal}{st_part}{suffix}"
+
+    tp_mult  = 3 if strategy == "L" else 2
+    lines = [f"**时间**：{ts}", f"**价格**：${price:.2f}"]
+    if score:
+        lines.append(f"**信号强度**：{score}分")
+    if atr is not None:
+        lines.append(f"**ATR(14)**：${atr:.2f}")
+    if tp is not None:
+        dist = abs(tp - price)
+        sign = "+" if tp > price else "-"
+        lines.append(f"**止盈(TP)**：${tp:.2f}　({sign}${dist:.2f}，{tp_mult}×ATR)")
+    if sl is not None:
+        dist = abs(sl - price)
+        sign = "-" if sl < price else "+"
+        lines.append(f"**止损(SL)**：${sl:.2f}　({sign}${dist:.2f}，1×ATR)")
+    content = "\n".join(lines)
+
     body = {
         "msg_type": "interactive",
         "card": {
@@ -174,6 +186,136 @@ def detect_signals(candles, tf="1m"):
         sig_time = datetime.fromtimestamp(result['t']).strftime('%H:%M')
         age_min  = int((now - result['t']) / 60)
         log(f" detect: 有信号 {result['dir']} @ {sig_time}，已过 {age_min} 分钟，跳过")
+    return None
+
+
+# ── 策略L辅助指标 ────────────────────────────────────────────
+def _calc_rsi(candles, period=14):
+    gains, losses = [], []
+    for i in range(1, len(candles)):
+        d = candles[i]['c'] - candles[i-1]['c']
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    if len(gains) < period:
+        return [50.0] * len(candles)
+    rsi = [50.0]
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period-1) + gains[i]) / period
+        avg_l = (avg_l * (period-1) + losses[i]) / period
+        rs = avg_g / avg_l if avg_l != 0 else 100
+        rsi.append(100 - 100 / (1 + rs))
+    while len(rsi) < len(candles):
+        rsi.insert(0, 50.0)
+    return rsi
+
+def _calc_atr_vals(candles, period=14):
+    tr = []
+    for i, d in enumerate(candles):
+        if i == 0:
+            tr.append(d['h'] - d['l'])
+        else:
+            prev = candles[i-1]
+            tr.append(max(d['h']-d['l'], abs(d['h']-prev['c']), abs(d['l']-prev['c'])))
+    atr, atr_val = [], sum(tr[:period]) / period
+    for i in range(len(candles)):
+        if i < period:
+            atr.append(atr_val); continue
+        atr_val = (atr_val * (period-1) + tr[i]) / period
+        atr.append(atr_val)
+    return atr
+
+def _calc_st_trend_list(candles, period=10, mult=2.5):
+    """返回每根K线的ST方向列表（1=多, -1=空）"""
+    tr = []
+    for i, d in enumerate(candles):
+        tr.append(d['h']-d['l'] if i==0 else
+                  max(d['h']-d['l'], abs(d['h']-candles[i-1]['c']), abs(d['l']-candles[i-1]['c'])))
+    atr, atr_val = [], sum(tr[:period]) / period
+    for i in range(len(candles)):
+        if i < period: atr.append(atr_val); continue
+        atr_val = (atr_val*(period-1) + tr[i]) / period
+        atr.append(atr_val)
+    trends, up_band, dn_band, trend, prev_up, prev_dn = [], 0, 0, 1, 0, 0
+    for i, d in enumerate(candles):
+        hl2 = (d['h']+d['l'])/2
+        raw_up, raw_dn = hl2+mult*atr[i], hl2-mult*atr[i]
+        if i == 0:
+            up_band, dn_band = raw_up, raw_dn
+        else:
+            up_band = raw_up if (raw_up < prev_up or candles[i-1]['c'] > prev_up) else prev_up
+            dn_band = raw_dn if (raw_dn > prev_dn or candles[i-1]['c'] < prev_dn) else prev_dn
+        if trend == -1 and d['c'] > up_band: trend = 1
+        elif trend == 1 and d['c'] < dn_band: trend = -1
+        trends.append(trend)
+        prev_up, prev_dn = up_band, dn_band
+    return trends
+
+def detect_signals_L(candles, tf="1m"):
+    """策略L: EMA5/13 + RSI过滤(<65买/>35卖) + 1m ST方向一致 + TP=3×ATR, SL=1×ATR"""
+    if len(candles) < 30:
+        return None
+    e5  = _calc_ema(candles, 5)
+    e13 = _calc_ema(candles, 13)
+    rsi = _calc_rsi(candles, 14)
+    atr = _calc_atr_vals(candles, 14)
+    st  = _calc_st_trend_list(candles)
+    interval = candles[1]['t'] - candles[0]['t']
+    last_sig_t, result = 0, None
+
+    for i in range(20, len(candles)):
+        d, prev = candles[i], candles[i-1]
+        e5c, e5p   = e5[i], e5[i-1]
+        e13c, e13p = e13[i], e13[i-1]
+
+        bull_engulf = d['c']>d['o'] and d['o']<=prev['c'] and d['c']>=prev['o'] and (d['c']-d['o'])>(prev['o']-prev['c'])*0.8
+        hammer      = d['c']>d['o'] and (d['o']-d['l'])>(d['c']-d['o'])*1.8 and (d['h']-d['c'])<(d['c']-d['o'])
+        ema_cross   = e5p < e13p and e5c > e13c
+        ema_support = d['c']>d['o'] and prev['c']<e5p and d['c']>e5c
+        buy_score   = (2 if bull_engulf else 0)+(2 if hammer else 0)+(3 if ema_cross else 0)+(1 if ema_support else 0)
+
+        bear_engulf = d['c']<d['o'] and d['o']>=prev['c'] and d['c']<=prev['o'] and (d['o']-d['c'])>(prev['c']-prev['o'])*0.8
+        shoot_star  = d['c']<d['o'] and (d['h']-d['o'])>(d['o']-d['c'])*1.8 and (d['c']-d['l'])<(d['o']-d['c'])
+        death_cross = e5p > e13p and e5c < e13c
+        ema_break   = d['c']<d['o'] and prev['c']>e5p and d['c']<e5c
+        sell_score  = (2 if bear_engulf else 0)+(2 if shoot_star else 0)+(3 if death_cross else 0)+(1 if ema_break else 0)
+
+        too_close = (d['t'] - last_sig_t) < 3 * interval
+        direction, score = None, 0
+        if not too_close and buy_score >= 3 and buy_score > sell_score:
+            direction, score = 'buy', buy_score
+        elif not too_close and sell_score >= 3 and sell_score > buy_score:
+            direction, score = 'sell', sell_score
+        if direction is None: continue
+
+        # RSI 过滤
+        if direction == 'buy'  and rsi[i] > 65: continue
+        if direction == 'sell' and rsi[i] < 35: continue
+        # ST 方向过滤
+        if direction == 'buy'  and st[i] != 1:  continue
+        if direction == 'sell' and st[i] != -1: continue
+
+        atr_val = atr[i]
+        if direction == 'buy':
+            tp, sl_p = d['c'] + 3*atr_val, d['c'] - 1*atr_val
+            sig_name = '强买▲' if score >= 5 else '买▲'
+            st_dir   = '▲ 多头'
+        else:
+            tp, sl_p = d['c'] - 3*atr_val, d['c'] + 1*atr_val
+            sig_name = '强卖▼' if score >= 5 else '卖▼'
+            st_dir   = '▼ 空头'
+
+        last_sig_t = d['t']
+        result = {'t': d['t'], 'dir': sig_name, 'score': score, 'price': d['c'],
+                  'tp': tp, 'sl': sl_p, 'st_dir': st_dir, 'strategy': 'L',
+                  'atr': atr_val}
+
+    tf_sec  = _TF_SECONDS.get(tf, 60)
+    max_age = tf_sec + 180
+    now     = time.time()
+    if result and (now - result['t']) <= max_age:
+        return result
     return None
 
 
@@ -456,9 +598,9 @@ def stats_loop():
 
 
 # ── K 线定时刷新 ──────────────────────────────────────────
-def _push_if_new(sig, tf):
+def _push_if_new(sig, tf, prefix=""):
     """推送信号，防重复"""
-    key = f"{tf}_{sig['t']}"
+    key = f"{prefix}{tf}_{sig['t']}"
     sig_time = datetime.fromtimestamp(sig['t']).strftime('%H:%M')
     if key in _sent_signals:
         log(f" [{tf}] 信号已推过: {sig['dir']} @ {sig_time}，跳过")
@@ -468,23 +610,43 @@ def _push_if_new(sig, tf):
         oldest = list(_sent_signals.keys())[0]
         del _sent_signals[oldest]
     score = sig.get('score', 0)
-    log(f" [{tf}] 新信号: {sig['dir']} @ {sig_time}" + (f"  score={score}" if score else ""))
-    send_feishu(sig['dir'], sig['price'], score, tf)
+    log(f" [{tf}]{prefix} 新信号: {sig['dir']} @ {sig_time}" + (f"  score={score}" if score else ""))
+    send_feishu(sig['dir'], sig['price'], score, tf,
+                tp=sig.get('tp'), sl=sig.get('sl'),
+                st_dir=sig.get('st_dir'), strategy=sig.get('strategy'),
+                atr=sig.get('atr'))
 
 def _check_and_notify(candles, tf):
-    """检测技术信号 + ST翻转，推送飞书（防重复）"""
-    # 只对已收盘的 K 线检测信号，排除当前未收盘的最后一根
+    """检测技术信号 + ST翻转 + 策略L，推送飞书（防重复）"""
     closed = [c for c in candles if c.get("confirm", 1) == 1]
     if not closed:
         return
-    # 技术信号（买▲ / 卖▼ / 强买▲ / 强卖▼）
+    # 原始策略（买▲ / 卖▼ / 强买▲ / 强卖▼）
     sig = detect_signals(closed, tf)
     if sig:
+        # 附加 ST 方向
+        st_trends  = _calc_st_trend_list(closed)
+        current_st = st_trends[-1] if st_trends else 1
+        sig['st_dir'] = '▲ 多头' if current_st == 1 else '▼ 空头'
+        # 附加 ATR 动态 TP/SL（原始策略：TP=2×ATR, SL=1×ATR）
+        # 用信号所在K线的ATR，而非最后一根的ATR
+        atr_vals = _calc_atr_vals(closed)
+        sig_idx  = next((i for i, c in enumerate(closed) if c['t'] == sig['t']), len(closed) - 1)
+        atr_val  = atr_vals[sig_idx]
+        entry    = sig['price']
+        is_buy   = '买' in sig['dir']
+        sig['atr'] = atr_val
+        sig['tp']  = entry + 2 * atr_val if is_buy else entry - 2 * atr_val
+        sig['sl']  = entry - 1 * atr_val if is_buy else entry + 1 * atr_val
         _push_if_new(sig, tf)
     # ST 翻转（多▲ / 空▼）
     st = detect_st_flip(closed)
     if st:
         _push_if_new(st, tf)
+    # 策略L（EMA5/13 + RSI + ST方向 + TP/SL）
+    sig_l = detect_signals_L(closed, tf)
+    if sig_l:
+        _push_if_new(sig_l, tf, prefix="L_")
 
 
 def hist_loop():
@@ -531,15 +693,40 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/api/notify":
-            length = int(self.headers.get("Content-Length", 0))
-            body   = json.loads(self.rfile.read(length) or b"{}")
-            signal = body.get("signal", "")
-            price  = float(body.get("price", 0))
-            score  = int(body.get("score", 0))
-            tf     = body.get("tf", "")
-            log(f" /api/notify 收到浏览器信号: {signal} ${price:.2f} [{tf}]")
+            length   = int(self.headers.get("Content-Length", 0))
+            body     = json.loads(self.rfile.read(length) or b"{}")
+            signal   = body.get("signal", "")
+            price    = float(body.get("price", 0))
+            score    = int(body.get("score", 0))
+            tf       = body.get("tf", "")
+            tp       = body.get("tp")
+            sl       = body.get("sl")
+            st_dir   = body.get("st_dir")
+            strategy = body.get("strategy")
+            atr      = body.get("atr")
+            sig_t    = body.get("sig_t")   # 信号K线时间戳（用于去重）
+            tp       = float(tp)    if tp    is not None else None
+            sl       = float(sl)    if sl    is not None else None
+            atr      = float(atr)   if atr   is not None else None
+            sig_t    = int(sig_t)   if sig_t is not None else None
+            # 去重：若服务端已推过同一根K线的信号，浏览器不重复推
+            prefix = "L_" if strategy == "L" else ""
+            dedup_key = f"{prefix}{tf}_{sig_t}" if sig_t else None
+            if dedup_key and dedup_key in _sent_signals:
+                log(f" /api/notify 已推过，跳过: {signal} [{tf}] t={sig_t}")
+                self.send_response(200); self.cors(); self.end_headers()
+                self.wfile.write(b'{"ok":true,"skipped":true}')
+                return
+            log(f" /api/notify 收到浏览器信号: {signal} ${price:.2f} [{tf}]" +
+                (f" TP:{tp:.1f} SL:{sl:.1f}" if tp else ""))
+            # 标记为已推（防止下次再重复）
+            if dedup_key:
+                _sent_signals[dedup_key] = True
             threading.Thread(
-                target=send_feishu, args=(signal, price, score, tf), daemon=True
+                target=send_feishu,
+                args=(signal, price, score, tf),
+                kwargs={"tp": tp, "sl": sl, "st_dir": st_dir, "strategy": strategy, "atr": atr},
+                daemon=True
             ).start()
             self.send_response(200)
             self.cors(); self.end_headers()
