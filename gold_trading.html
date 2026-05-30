@@ -365,6 +365,7 @@ body {
   <div class="strategy-group">
     <button class="strategy-btn active" data-s="original" onclick="switchStrategy('original')">原始</button>
     <button class="strategy-btn" data-s="L" onclick="switchStrategy('L')">策略L</button>
+    <button class="strategy-btn" data-s="LB" onclick="switchStrategy('LB')">策略LB</button>
   </div>
   <div class="vd"></div>
   <div id="session-badge" class="session-asia">亚盘</div>
@@ -748,7 +749,7 @@ function calcSupertrend(data, period = 10, mult = 2.5) {
         fetch('http://localhost:8888/api/notify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ signal: stSig, price: stPx, score: 0, tf: currentTF }),
+          body: JSON.stringify({ signal: stSig, price: stPx, score: 0, tf: currentTF, sig_t: data[data.length - 1].t }),
         }).catch(() => {});
       }
       markers.push({
@@ -834,15 +835,91 @@ function calcATR(data, period = 14) {
 }
 
 // ─── Strategy switcher ────────────────────────────────────────
+// ─── 策略LB 信号标记（策略L + ST + EMA13斜率过滤，TP=3×ATR）────────
+function generateMarkersLB(data, stTrends) {
+  if (data.length < 25) return [];
+  const e5  = calcEMA(data, 5).map(d => d.value);
+  const e13 = calcEMA(data, 13).map(d => d.value);
+  const rsi = calcRSI(data, 14);
+  const atr = calcATR(data, 14);
+  const markers = [];
+  const interval = data.length > 1 ? data[1].t - data[0].t : 60;
+
+  for (let i = 20; i < data.length; i++) {
+    const d = data[i], prev = data[i-1];
+    const e5c = e5[i], e5p = e5[i-1];
+    const e13c = e13[i], e13p = e13[i-1];
+    const atrVal = atr[i];
+
+    // EMA13斜率过滤（排除震荡）
+    if (i >= 5) {
+      const slope = Math.abs(e13[i] - e13[i-5]) / (atrVal || 1);
+      if (slope < 0.3) continue;
+    }
+
+    const bullEngulf = d.c>d.o && d.o<=prev.c && d.c>=prev.o && (d.c-d.o)>(prev.o-prev.c)*0.8;
+    const hammer     = d.c>d.o && (d.o-d.l)>(d.c-d.o)*1.8 && (d.h-d.c)<(d.c-d.o);
+    const emaCross   = e5p < e13p && e5c > e13c;
+    const emaSupport = d.c>d.o && prev.c<e5p && d.c>e5c;
+    const buyScore   = (bullEngulf?2:0)+(hammer?2:0)+(emaCross?3:0)+(emaSupport?1:0);
+
+    const bearEngulf = d.c<d.o && d.o>=prev.c && d.c<=prev.o && (d.o-d.c)>(prev.c-prev.o)*0.8;
+    const shootStar  = d.c<d.o && (d.h-d.o)>(d.o-d.c)*1.8 && (d.c-d.l)<(d.o-d.c);
+    const deathCross = e5p > e13p && e5c < e13c;
+    const emaBreak   = d.c<d.o && prev.c>e5p && d.c<e5c;
+    const sellScore  = (bearEngulf?2:0)+(shootStar?2:0)+(deathCross?3:0)+(emaBreak?1:0);
+
+    const lastM   = markers[markers.length - 1];
+    const tooClose = lastM && (d.t - lastM.time) < 3 * interval;
+    if (tooClose) continue;
+
+    let direction = null, score = 0;
+    if (buyScore >= 3 && buyScore > sellScore)       { direction = 'buy';  score = buyScore; }
+    else if (sellScore >= 3 && sellScore > buyScore) { direction = 'sell'; score = sellScore; }
+    if (!direction) continue;
+
+    if (direction === 'buy'  && rsi[i] > 65) continue;
+    if (direction === 'sell' && rsi[i] < 35) continue;
+
+    // ST 方向过滤
+    const stDir = stTrends[i];
+    if (direction === 'buy'  && stDir !== 1)  continue;
+    if (direction === 'sell' && stDir !== -1) continue;
+
+    const tp = direction === 'buy'  ? d.c + 3.0*atrVal : d.c - 3.0*atrVal;
+    const sl = direction === 'buy'  ? d.c - 1*atrVal   : d.c + 1*atrVal;
+
+    markers.push({
+      time: d.t,
+      position: direction === 'buy' ? 'belowBar' : 'aboveBar',
+      color:     direction === 'buy' ? '#3dd68c' : '#e05252',
+      shape:     direction === 'buy' ? 'arrowUp'  : 'arrowDown',
+      text:      direction === 'buy' ? (score>=5?'强买▲':'买▲') : (score>=5?'强卖▼':'卖▼'),
+      size: score >= 5 ? 2 : 1,
+      _tp: tp, _sl: sl, _score: score, _stDir: direction==='buy'?'▲ 多头':'▼ 空头',
+      _atr: atrVal, _entry: d.c,
+    });
+  }
+  return markers;
+}
+
 function switchStrategy(s) {
   currentStrategy = s;
   document.querySelectorAll('.strategy-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.s === s));
   // 更新图例标签
-  const isL = s === 'L';
-  document.getElementById('leg-ema1-label').textContent = isL ? 'EMA5'  : 'EMA20';
-  document.getElementById('leg-ema2-label').textContent = isL ? 'EMA13' : 'EMA50';
-  document.getElementById('leg-strategy').style.display  = isL ? '' : 'none';
+  const isL  = s === 'L';
+  const isLC = s === 'LC';
+  const isLB = s === 'LB';
+  document.getElementById('leg-ema1-label').textContent = (isL || isLC || isLB) ? 'EMA5'  : 'EMA20';
+  document.getElementById('leg-ema2-label').textContent = (isL || isLC || isLB) ? 'EMA13' : 'EMA50';
+  const legStrategy = document.getElementById('leg-strategy');
+  if (isL || isLC || isLB) {
+    legStrategy.style.display = '';
+    legStrategy.textContent   = isLC ? '策略LC' : isLB ? '策略LB' : '策略L';
+  } else {
+    legStrategy.style.display = 'none';
+  }
   // 静默重渲染（不推送），渲染完后 _lastMkrTime 会自动更新到最新信号时间
   _suppressPush = true;
   if (candles.length > 0) renderChart(candles);
@@ -895,14 +972,9 @@ function generateMarkersL(data, stTrends) {
     if (direction === 'buy'  && rsi[i] > 65) continue;
     if (direction === 'sell' && rsi[i] < 35) continue;
 
-    // ST 方向过滤
-    const stTrend = stTrends[i];
-    if (direction === 'buy'  && stTrend !== 1)  continue;
-    if (direction === 'sell' && stTrend !== -1) continue;
-
     const atrVal = atr[i];
-    const tp = direction === 'buy'  ? d.c + 3*atrVal : d.c - 3*atrVal;
-    const sl = direction === 'buy'  ? d.c - 1*atrVal : d.c + 1*atrVal;
+    const tp = direction === 'buy'  ? d.c + 2.5*atrVal : d.c - 2.5*atrVal;
+    const sl = direction === 'buy'  ? d.c - 1*atrVal  : d.c + 1*atrVal;
     const stDir = direction === 'buy' ? '▲ 多头' : '▼ 空头';
 
     markers.push({
@@ -913,6 +985,92 @@ function generateMarkersL(data, stTrends) {
       text:      direction === 'buy' ? (score>=5?'强买▲':'买▲') : (score>=5?'强卖▼':'卖▼'),
       size: score >= 5 ? 2 : 1,
       _tp: tp, _sl: sl, _score: score, _stDir: stDir, _atr: atrVal, _entry: d.c,
+    });
+  }
+  return markers;
+}
+
+// ─── 策略LC 信号标记（策略L + 方案C，TP=4×ATR）──────────────────
+function calcVolMA(data, period = 10) {
+  return data.map((_, i) => {
+    const sl = data.slice(Math.max(0, i - period + 1), i + 1);
+    return sl.reduce((s, d) => s + d.v, 0) / sl.length;
+  });
+}
+
+function generateMarkersLC(data, stTrends) {
+  if (data.length < 25) return [];
+  const e5  = calcEMA(data, 5).map(d => d.value);
+  const e13 = calcEMA(data, 13).map(d => d.value);
+  const rsi = calcRSI(data, 14);
+  const atr = calcATR(data, 14);
+  const vma = calcVolMA(data, 10);
+  const interval = data.length > 1 ? data[1].t - data[0].t : 60;
+
+  const markers = [];
+
+  for (let i = 20; i < data.length; i++) {
+    const d = data[i], prev = data[i-1];
+    const lastM = markers[markers.length - 1];
+    if (lastM && (d.t - lastM.time) < 3 * interval) continue;
+
+    const e5c = e5[i], e5p = e5[i-1];
+    const e13c = e13[i], e13p = e13[i-1];
+    const stDir = stTrends[i];
+
+    // ── 策略L 评分 ──
+    const bullEngulf = d.c>d.o && d.o<=prev.c && d.c>=prev.o && (d.c-d.o)>(prev.o-prev.c)*0.8;
+    const hammer     = d.c>d.o && (d.o-d.l)>(d.c-d.o)*1.8 && (d.h-d.c)<(d.c-d.o);
+    const emaCross   = e5p < e13p && e5c > e13c;
+    const emaSupport = d.c>d.o && prev.c<e5p && d.c>e5c;
+    const buyScore   = (bullEngulf?2:0)+(hammer?2:0)+(emaCross?3:0)+(emaSupport?1:0);
+
+    const bearEngulf = d.c<d.o && d.o>=prev.c && d.c<=prev.o && (d.o-d.c)>(prev.c-prev.o)*0.8;
+    const shootStar  = d.c<d.o && (d.h-d.o)>(d.o-d.c)*1.8 && (d.c-d.l)<(d.o-d.c);
+    const deathCross = e5p > e13p && e5c < e13c;
+    const emaBreak   = d.c<d.o && prev.c>e5p && d.c<e5c;
+    const sellScore  = (bearEngulf?2:0)+(shootStar?2:0)+(deathCross?3:0)+(emaBreak?1:0);
+
+    let direction = null, score = 0;
+
+    // 策略L 触发
+    if (buyScore >= 3 && buyScore > sellScore && rsi[i] <= 65)  { direction = 'buy';  score = buyScore; }
+    else if (sellScore >= 3 && sellScore > buyScore && rsi[i] >= 35) { direction = 'sell'; score = sellScore; }
+
+    // 方案C 触发（A宽 OR B宽 + ST方向）
+    if (!direction && i >= 5) {
+      const atrV    = atr[i];
+      const volRatio = vma[i] > 0 ? d.v / vma[i] : 0;
+      const prevH   = Math.max(...[data[i-3], data[i-2], data[i-1]].map(x => x.h));
+      const prevL   = Math.min(...[data[i-3], data[i-2], data[i-1]].map(x => x.l));
+
+      const volBuy  = volRatio >= 1.5 && d.c > prevH && stDir === 1;
+      const volSell = volRatio >= 1.5 && d.c < prevL  && stDir === -1;
+
+      const bullStreak = d.c > d.o && data[i-1].c > data[i-1].o;
+      const bearStreak = d.c < d.o && data[i-1].c < data[i-1].o;
+      const momBuy  = bullStreak && (d.c - data[i-1].o) >= 0.5 * atrV && stDir === 1;
+      const momSell = bearStreak && (data[i-1].o - d.c) >= 0.5 * atrV && stDir === -1;
+
+      if (volBuy  || momBuy)  { direction = 'buy';  score = 3; }
+      else if (volSell || momSell) { direction = 'sell'; score = 3; }
+    }
+
+    if (!direction) continue;
+
+    const atrVal = atr[i];
+    const tp = direction === 'buy'  ? d.c + 4*atrVal : d.c - 4*atrVal;
+    const sl = direction === 'buy'  ? d.c - 1*atrVal : d.c + 1*atrVal;
+    const stDirStr = direction === 'buy' ? '▲ 多头' : '▼ 空头';
+
+    markers.push({
+      time: d.t,
+      position: direction === 'buy' ? 'belowBar' : 'aboveBar',
+      color:     direction === 'buy' ? '#3dd68c' : '#e05252',
+      shape:     direction === 'buy' ? 'arrowUp'  : 'arrowDown',
+      text:      direction === 'buy' ? (score>=5?'强买▲':'买▲') : (score>=5?'强卖▼':'卖▼'),
+      size: score >= 5 ? 2 : 1,
+      _tp: tp, _sl: sl, _score: score, _stDir: stDirStr, _atr: atrVal, _entry: d.c,
     });
   }
   return markers;
@@ -940,9 +1098,11 @@ function renderChart(data) {
   volSeries.setData(vData);
 
   // ── EMAs（根据策略切换）──
-  const isL = currentStrategy === 'L';
-  ema20S.setData(calcEMA(data, isL ? 5  : 20));
-  ema50S.setData(calcEMA(data, isL ? 13 : 50));
+  const isL  = currentStrategy === 'L';
+  const isLC = currentStrategy === 'LC';
+  const isLB = currentStrategy === 'LB';
+  ema20S.setData(calcEMA(data, (isL || isLC || isLB) ? 5  : 20));
+  ema50S.setData(calcEMA(data, (isL || isLC || isLB) ? 13 : 50));
   ema200S.setData(calcEMA(data, 200));
 
   // Bollinger Bands
@@ -961,7 +1121,11 @@ function renderChart(data) {
   const stTrends = st.bullLine.map(d => d.value != null ? 1 : -1);
 
   let techMarkers;
-  if (isL) {
+  if (isLC) {
+    techMarkers = generateMarkersLC(closedData, stTrends.slice(0, closedData.length));
+  } else if (isLB) {
+    techMarkers = generateMarkersLB(closedData, stTrends.slice(0, closedData.length));
+  } else if (isL) {
     techMarkers = generateMarkersL(closedData, stTrends.slice(0, closedData.length));
   } else {
     techMarkers = generateMarkers(closedData);
@@ -996,7 +1160,11 @@ function renderChart(data) {
                         tp: last._tp, sl: last._sl, atr: last._atr,
                         st_dir: last._stDir,   // 两个策略都带 ST 方向
                         sig_t: last.time };    // 信号K线时间戳，用于服务端去重
-      if (isL) {
+      if (isLC) {
+        payload.strategy = 'LC';
+      } else if (isLB) {
+        payload.strategy = 'LB';
+      } else if (isL) {
         payload.strategy = 'L';
       }
       fetch('http://localhost:8888/api/notify', {

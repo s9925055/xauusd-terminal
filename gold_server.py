@@ -73,11 +73,23 @@ def send_feishu(signal: str, price: float, score: int, tf: str,
     }
     emoji    = emoji_map.get(signal, "📊")
     ts       = datetime.now().strftime("%H:%M:%S")
-    suffix   = " 【策略L】" if strategy == "L" else ""
+    if strategy == "LC":
+        suffix = " 【策略LC】"
+    elif strategy == "LB":
+        suffix = " 【策略LB】"
+    elif strategy == "L":
+        suffix = " 【策略L】"
+    else:
+        suffix = ""
     st_part  = f" {st_dir}" if st_dir else ""
     title    = f"{emoji} [{tf}] XAU/USD {signal}{st_part}{suffix}"
 
-    tp_mult  = 3 if strategy == "L" else 2
+    if strategy == "LB":
+        tp_mult = 3.0
+    elif strategy == "L":
+        tp_mult = 2.5
+    else:
+        tp_mult = 2
     lines = [f"**时间**：{ts}", f"**价格**：${price:.2f}"]
     if score:
         lines.append(f"**信号强度**：{score}分")
@@ -253,14 +265,13 @@ def _calc_st_trend_list(candles, period=10, mult=2.5):
     return trends
 
 def detect_signals_L(candles, tf="1m"):
-    """策略L: EMA5/13 + RSI过滤(<65买/>35卖) + 1m ST方向一致 + TP=3×ATR, SL=1×ATR"""
+    """策略L: EMA5/13 + RSI过滤(<65买/>35卖) + TP=3×ATR, SL=1×ATR"""
     if len(candles) < 30:
         return None
     e5  = _calc_ema(candles, 5)
     e13 = _calc_ema(candles, 13)
     rsi = _calc_rsi(candles, 14)
     atr = _calc_atr_vals(candles, 14)
-    st  = _calc_st_trend_list(candles)
     interval = candles[1]['t'] - candles[0]['t']
     last_sig_t, result = 0, None
 
@@ -292,17 +303,14 @@ def detect_signals_L(candles, tf="1m"):
         # RSI 过滤
         if direction == 'buy'  and rsi[i] > 65: continue
         if direction == 'sell' and rsi[i] < 35: continue
-        # ST 方向过滤
-        if direction == 'buy'  and st[i] != 1:  continue
-        if direction == 'sell' and st[i] != -1: continue
 
         atr_val = atr[i]
         if direction == 'buy':
-            tp, sl_p = d['c'] + 3*atr_val, d['c'] - 1*atr_val
+            tp, sl_p = d['c'] + 2.5*atr_val, d['c'] - 1*atr_val
             sig_name = '强买▲' if score >= 5 else '买▲'
             st_dir   = '▲ 多头'
         else:
-            tp, sl_p = d['c'] - 3*atr_val, d['c'] + 1*atr_val
+            tp, sl_p = d['c'] - 2.5*atr_val, d['c'] + 1*atr_val
             sig_name = '强卖▼' if score >= 5 else '卖▼'
             st_dir   = '▼ 空头'
 
@@ -312,7 +320,182 @@ def detect_signals_L(candles, tf="1m"):
                   'atr': atr_val}
 
     tf_sec  = _TF_SECONDS.get(tf, 60)
-    max_age = tf_sec + 180
+    max_age = tf_sec + 30   # 只接受最近1根K线的信号（+30秒缓冲）
+    now     = time.time()
+    if result and (now - result['t']) <= max_age:
+        return result
+    return None
+
+
+def detect_signals_LB(candles, tf="1m"):
+    """策略LB: 策略L + ST方向过滤 + EMA13斜率过滤(>0.3×ATR) + TP=3×ATR, SL=1×ATR"""
+    if len(candles) < 30:
+        return None
+    e5  = _calc_ema(candles, 5)
+    e13 = _calc_ema(candles, 13)
+    rsi = _calc_rsi(candles, 14)
+    atr = _calc_atr_vals(candles, 14)
+    st  = _calc_st_trend_list(candles, 10, 2.5)
+    interval = candles[1]['t'] - candles[0]['t']
+    last_sig_t, result = 0, None
+
+    for i in range(20, len(candles)):
+        d, prev = candles[i], candles[i-1]
+        if (d['t'] - last_sig_t) < 3 * interval:
+            continue
+
+        # EMA13斜率过滤（排除震荡）
+        if i >= 5:
+            slope = abs(e13[i] - e13[i-5]) / atr[i] if atr[i] > 0 else 0
+            if slope < 0.3:
+                continue
+
+        e5c, e5p   = e5[i], e5[i-1]
+        e13c, e13p = e13[i], e13[i-1]
+
+        bull_engulf = d['c']>d['o'] and d['o']<=prev['c'] and d['c']>=prev['o'] and (d['c']-d['o'])>(prev['o']-prev['c'])*0.8
+        hammer      = d['c']>d['o'] and (d['o']-d['l'])>(d['c']-d['o'])*1.8 and (d['h']-d['c'])<(d['c']-d['o'])
+        ema_cross   = e5p < e13p and e5c > e13c
+        ema_support = d['c']>d['o'] and prev['c']<e5p and d['c']>e5c
+        buy_score   = (2 if bull_engulf else 0)+(2 if hammer else 0)+(3 if ema_cross else 0)+(1 if ema_support else 0)
+
+        bear_engulf = d['c']<d['o'] and d['o']>=prev['c'] and d['c']<=prev['o'] and (d['o']-d['c'])>(prev['c']-prev['o'])*0.8
+        shoot_star  = d['c']<d['o'] and (d['h']-d['o'])>(d['o']-d['c'])*1.8 and (d['c']-d['l'])<(d['o']-d['c'])
+        death_cross = e5p > e13p and e5c < e13c
+        ema_break   = d['c']<d['o'] and prev['c']>e5p and d['c']<e5c
+        sell_score  = (2 if bear_engulf else 0)+(2 if shoot_star else 0)+(3 if death_cross else 0)+(1 if ema_break else 0)
+
+        direction, score = None, 0
+        if buy_score >= 3 and buy_score > sell_score:
+            direction, score = 'buy', buy_score
+        elif sell_score >= 3 and sell_score > buy_score:
+            direction, score = 'sell', sell_score
+        if direction is None: continue
+
+        # RSI 过滤
+        if direction == 'buy'  and rsi[i] > 65: continue
+        if direction == 'sell' and rsi[i] < 35: continue
+
+        # ST 方向过滤
+        if direction == 'buy'  and st[i] != 1:  continue
+        if direction == 'sell' and st[i] != -1: continue
+
+        atr_val = atr[i]
+        if direction == 'buy':
+            tp, sl_p = d['c'] + 3.0*atr_val, d['c'] - 1*atr_val
+            sig_name = '强买▲' if score >= 5 else '买▲'
+            st_dir   = '▲ 多头'
+        else:
+            tp, sl_p = d['c'] - 3.0*atr_val, d['c'] + 1*atr_val
+            sig_name = '强卖▼' if score >= 5 else '卖▼'
+            st_dir   = '▼ 空头'
+
+        last_sig_t = d['t']
+        result = {'t': d['t'], 'dir': sig_name, 'score': score, 'price': d['c'],
+                  'tp': tp, 'sl': sl_p, 'st_dir': st_dir, 'strategy': 'LB',
+                  'atr': atr_val}
+
+    tf_sec  = _TF_SECONDS.get(tf, 60)
+    max_age = tf_sec + 30
+    now     = time.time()
+    if result and (now - result['t']) <= max_age:
+        return result
+    return None
+
+
+def _calc_vol_ma(candles, period=10):
+    vols = [c['v'] for c in candles]
+    out  = []
+    for i in range(len(vols)):
+        sl = vols[max(0, i - period + 1):i + 1]
+        out.append(sum(sl) / len(sl))
+    return out
+
+
+def detect_signals_LC(candles, tf="1m"):
+    """策略LC: 策略L + 方案C (放量突破 OR 连续阳线 + ST) + TP=4×ATR, SL=1×ATR"""
+    if len(candles) < 30:
+        return None
+    e5   = _calc_ema(candles, 5)
+    e13  = _calc_ema(candles, 13)
+    rsi  = _calc_rsi(candles, 14)
+    atr  = _calc_atr_vals(candles, 14)
+    vma  = _calc_vol_ma(candles, 10)
+    st   = _calc_st_trend_list(candles, 10, 2.5)
+    interval   = candles[1]['t'] - candles[0]['t']
+    last_sig_t, result = 0, None
+
+    for i in range(20, len(candles)):
+        d, prev = candles[i], candles[i-1]
+        if (d['t'] - last_sig_t) < 3 * interval:
+            continue
+
+        # ── 策略L 评分 ──
+        e5c, e5p   = e5[i], e5[i-1]
+        e13c, e13p = e13[i], e13[i-1]
+
+        bull_engulf = d['c']>d['o'] and d['o']<=prev['c'] and d['c']>=prev['o'] and (d['c']-d['o'])>(prev['o']-prev['c'])*0.8
+        hammer      = d['c']>d['o'] and (d['o']-d['l'])>(d['c']-d['o'])*1.8 and (d['h']-d['c'])<(d['c']-d['o'])
+        ema_cross   = e5p < e13p and e5c > e13c
+        ema_support = d['c']>d['o'] and prev['c']<e5p and d['c']>e5c
+        buy_score   = (2 if bull_engulf else 0)+(2 if hammer else 0)+(3 if ema_cross else 0)+(1 if ema_support else 0)
+
+        bear_engulf = d['c']<d['o'] and d['o']>=prev['c'] and d['c']<=prev['o'] and (d['o']-d['c'])>(prev['c']-prev['o'])*0.8
+        shoot_star  = d['c']<d['o'] and (d['h']-d['o'])>(d['o']-d['c'])*1.8 and (d['c']-d['l'])<(d['o']-d['c'])
+        death_cross = e5p > e13p and e5c < e13c
+        ema_break   = d['c']<d['o'] and prev['c']>e5p and d['c']<e5c
+        sell_score  = (2 if bear_engulf else 0)+(2 if shoot_star else 0)+(3 if death_cross else 0)+(1 if ema_break else 0)
+
+        direction, score = None, 0
+
+        # 策略L 触发（RSI过滤）
+        if buy_score >= 3 and buy_score > sell_score and rsi[i] <= 65:
+            direction, score = 'buy', buy_score
+        elif sell_score >= 3 and sell_score > buy_score and rsi[i] >= 35:
+            direction, score = 'sell', sell_score
+
+        # ── 方案C 触发（A宽 OR B宽，带ST过滤）──
+        if direction is None and i >= 5:
+            atr_v     = atr[i]
+            vol_ratio = d['v'] / vma[i] if vma[i] > 0 else 0
+            prev_h    = [candles[j]['h'] for j in range(i-3, i)]
+            prev_l    = [candles[j]['l'] for j in range(i-3, i)]
+
+            # A宽：量>1.5×均 + 突破3根高/低点 + ST方向一致
+            vol_buy  = vol_ratio >= 1.5 and d['c'] > max(prev_h) and st[i] == 1
+            vol_sell = vol_ratio >= 1.5 and d['c'] < min(prev_l)  and st[i] == -1
+
+            # B宽：连续2根同向 + 总涨跌 > 0.5×ATR + ST方向一致
+            bull_streak = d['c'] > d['o'] and candles[i-1]['c'] > candles[i-1]['o']
+            bear_streak = d['c'] < d['o'] and candles[i-1]['c'] < candles[i-1]['o']
+            mom_buy  = bull_streak and (d['c'] - candles[i-1]['o']) >= 0.5*atr_v and st[i] == 1
+            mom_sell = bear_streak and (candles[i-1]['o'] - d['c']) >= 0.5*atr_v and st[i] == -1
+
+            if vol_buy or mom_buy:
+                direction, score = 'buy', 3
+            elif vol_sell or mom_sell:
+                direction, score = 'sell', 3
+
+        if direction is None:
+            continue
+
+        atr_val = atr[i]
+        if direction == 'buy':
+            tp, sl_p = d['c'] + 4*atr_val, d['c'] - 1*atr_val
+            sig_name = '强买▲' if score >= 5 else '买▲'
+            st_dir   = '▲ 多头'
+        else:
+            tp, sl_p = d['c'] - 4*atr_val, d['c'] + 1*atr_val
+            sig_name = '强卖▼' if score >= 5 else '卖▼'
+            st_dir   = '▼ 空头'
+
+        last_sig_t = d['t']
+        result = {'t': d['t'], 'dir': sig_name, 'score': score, 'price': d['c'],
+                  'tp': tp, 'sl': sl_p, 'st_dir': st_dir, 'strategy': 'LC',
+                  'atr': atr_val}
+
+    tf_sec  = _TF_SECONDS.get(tf, 60)
+    max_age = tf_sec + 30
     now     = time.time()
     if result and (now - result['t']) <= max_age:
         return result
@@ -377,6 +560,22 @@ def detect_st_flip(candles, period=10, mult=2.5):
 
 # ── 已推送信号记录（防重复推送）────────────────────────────
 _sent_signals = {}   # key: "{tf}_{candle_t}" → True
+
+# ── 策略L 全局信号时间戳（跨调用保持，防止连续K线重复触发）──
+_L_last_sig_t = {}   # key: tf → 上次发出信号的K线时间戳
+
+# ── 最新交易信号（供 MT5 EA 轮询）────────────────────────────
+_latest_signal = {
+    "signal":    None,   # '买▲' / '卖▼' / '强买▲' / '强卖▼'
+    "direction": None,   # 'buy' / 'sell'（MT5 EA 直接用）
+    "price":     0.0,
+    "tp":        0.0,
+    "sl":        0.0,
+    "atr":       0.0,
+    "strategy":  None,   # 'original' / 'L'
+    "tf":        None,   # '1m' / '5m'
+    "ts":        "0",    # 信号K线时间戳（秒），字符串，MT5 用于去重
+}
 
 
 # ── OKX REST：K 线 ────────────────────────────────────────
@@ -600,11 +799,13 @@ def stats_loop():
 # ── K 线定时刷新 ──────────────────────────────────────────
 def _push_if_new(sig, tf, prefix=""):
     """推送信号，防重复"""
+    global _latest_signal, _last_L_push
     key = f"{prefix}{tf}_{sig['t']}"
     sig_time = datetime.fromtimestamp(sig['t']).strftime('%H:%M')
     if key in _sent_signals:
         log(f" [{tf}] 信号已推过: {sig['dir']} @ {sig_time}，跳过")
         return
+
     _sent_signals[key] = True
     if len(_sent_signals) > 200:
         oldest = list(_sent_signals.keys())[0]
@@ -615,6 +816,21 @@ def _push_if_new(sig, tf, prefix=""):
                 tp=sig.get('tp'), sl=sig.get('sl'),
                 st_dir=sig.get('st_dir'), strategy=sig.get('strategy'),
                 atr=sig.get('atr'))
+    # 更新最新交易信号供 MT5 EA 轮询（只记录策略L的买卖信号）
+    dir_str = sig.get('dir', '')
+    if ('买' in dir_str or '卖' in dir_str) and sig.get('strategy') == 'LB':
+        direction = 'buy' if '买' in dir_str else 'sell'
+        _latest_signal.update({
+            "signal":    dir_str,
+            "direction": direction,
+            "price":     sig.get('price', 0.0),
+            "tp":        sig.get('tp', 0.0) or 0.0,
+            "sl":        sig.get('sl', 0.0) or 0.0,
+            "atr":       sig.get('atr', 0.0) or 0.0,
+            "strategy":  sig.get('strategy') or 'original',
+            "tf":        tf,
+            "ts":        str(sig['t']),
+        })
 
 def _check_and_notify(candles, tf):
     """检测技术信号 + ST翻转 + 策略L，推送飞书（防重复）"""
@@ -643,10 +859,14 @@ def _check_and_notify(candles, tf):
     st = detect_st_flip(closed)
     if st:
         _push_if_new(st, tf)
-    # 策略L（EMA5/13 + RSI + ST方向 + TP/SL）
+    # 策略L（EMA5/13 + RSI + TP=2.5×ATR）
     sig_l = detect_signals_L(closed, tf)
     if sig_l:
         _push_if_new(sig_l, tf, prefix="L_")
+    # 策略LB（策略L + ST + EMA13斜率过滤 + TP=3×ATR）
+    sig_lb = detect_signals_LB(closed, tf)
+    if sig_lb:
+        _push_if_new(sig_lb, tf, prefix="LB_")
 
 
 def hist_loop():
@@ -710,7 +930,7 @@ class Handler(BaseHTTPRequestHandler):
             atr      = float(atr)   if atr   is not None else None
             sig_t    = int(sig_t)   if sig_t is not None else None
             # 去重：若服务端已推过同一根K线的信号，浏览器不重复推
-            prefix = "L_" if strategy == "L" else ""
+            prefix = "LC_" if strategy == "LC" else ("LB_" if strategy == "LB" else ("L_" if strategy == "L" else ""))
             dedup_key = f"{prefix}{tf}_{sig_t}" if sig_t else None
             if dedup_key and dedup_key in _sent_signals:
                 log(f" /api/notify 已推过，跳过: {signal} [{tf}] t={sig_t}")
@@ -778,6 +998,11 @@ class Handler(BaseHTTPRequestHandler):
                 "change":    s["change"] or 0,
                 "changePct": s["change_pct"] or 0,
             }, "error": None}).encode()
+            self._json(body)
+
+        elif path == "/api/latest-signal":
+            with state_lock:
+                body = json.dumps(_latest_signal).encode()
             self._json(body)
 
         elif path == "/api/history":
